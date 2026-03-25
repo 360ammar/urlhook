@@ -1,0 +1,195 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION="0.1.0"
+TIMEOUT=10
+URL=""
+
+# Resolve app path relative to this script
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_PATH="$SCRIPT_DIR/../macos/urlhook.app"
+
+usage() {
+    echo "Usage: urlhook <url> [options]"
+    echo ""
+    echo "Execute x-callback-urls on macOS and return the response."
+    echo ""
+    echo "Arguments:"
+    echo "  url              x-callback-url to call"
+    echo ""
+    echo "Options:"
+    echo "  --timeout, -t    Timeout in seconds (default: 10)"
+    echo "  --help, -h       Show this help"
+    echo "  --version, -v    Show version"
+    exit 0
+}
+
+# Parse arguments — URL is first non-flag argument
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --timeout|-t)
+            if [[ $# -lt 2 ]] || [[ "$2" == -* ]]; then
+                echo "Error: --timeout requires a value" >&2
+                exit 1
+            fi
+            if ! [[ "$2" =~ ^[0-9]+$ ]] || [[ "$2" -le 0 ]]; then
+                echo "Error: --timeout must be a positive integer" >&2
+                exit 1
+            fi
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            ;;
+        --version|-v)
+            echo "urlhook $VERSION"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -z "$URL" ]]; then
+                URL="$1"
+            else
+                echo "Unexpected argument: $1" >&2
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$URL" ]]; then
+    echo "Error: URL argument required" >&2
+    echo "Usage: urlhook <url> [options]" >&2
+    exit 1
+fi
+
+# Check macOS
+if [[ "$(uname)" != "Darwin" ]]; then
+    echo "Error: urlhook only works on macOS" >&2
+    exit 1
+fi
+
+# Check app bundle exists
+if [[ ! -d "$APP_PATH" ]]; then
+    echo "Error: urlhook.app not found at $APP_PATH" >&2
+    exit 1
+fi
+
+# Generate UUID for this request
+UUID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+SOCK_PATH="${TMPDIR}urlhook-$UUID.sock"
+RESPONSE_FILE="${TMPDIR}urlhook-$UUID.response"
+
+# Cleanup on exit
+cleanup() {
+    rm -f "$SOCK_PATH" "$RESPONSE_FILE"
+    # Kill the app if still running
+    pkill -f "urlhook.app/Contents/MacOS/urlhook.*$UUID" 2>/dev/null || true
+    # Kill nc listener if still running
+    if [[ -n "${NC_PID:-}" ]]; then
+        kill "$NC_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
+
+# Modify URL — inject x-success, x-error, x-cancel
+modify_url() {
+    local url="$1"
+    local uuid="$2"
+
+    # Split URL into base and query
+    local base="${url%%\?*}"
+    local query=""
+    if [[ "$url" == *"?"* ]]; then
+        query="${url#*\?}"
+    fi
+
+    # Remove existing x-success, x-error, x-cancel params
+    local new_query=""
+    if [[ -n "$query" ]]; then
+        IFS='&' read -ra PARAMS <<< "$query"
+        for param in "${PARAMS[@]}"; do
+            local key="${param%%=*}"
+            case "$key" in
+                x-success|x-error|x-cancel|x-source) ;;
+                *)
+                    if [[ -n "$new_query" ]]; then
+                        new_query="$new_query&$param"
+                    else
+                        new_query="$param"
+                    fi
+                    ;;
+            esac
+        done
+    fi
+
+    # Percent-encode the callback URLs (single python3 call)
+    local encoded
+    encoded=$(python3 -c "
+import urllib.parse
+uuid = '$uuid'
+s = urllib.parse.quote(f'urlhook://success/{uuid}', safe='')
+e = urllib.parse.quote(f'urlhook://error/{uuid}', safe='')
+c = urllib.parse.quote(f'urlhook://cancel/{uuid}', safe='')
+print(f'x-source=urlhook&x-success={s}&x-error={e}&x-cancel={c}')
+")
+
+    if [[ -n "$new_query" ]]; then
+        echo "${base}?${new_query}&${encoded}"
+    else
+        echo "${base}?${encoded}"
+    fi
+}
+
+MODIFIED_URL=$(modify_url "$URL" "$UUID")
+
+# Start listening on socket in background, capture response
+nc -lU "$SOCK_PATH" > "$RESPONSE_FILE" &
+NC_PID=$!
+
+# Wait for socket file to exist before launching app
+for _ in $(seq 1 20); do
+    [[ -S "$SOCK_PATH" ]] && break
+    sleep 0.05
+done
+if [[ ! -S "$SOCK_PATH" ]]; then
+    echo '{"success":false,"params":{"errorCode":"socket_failed","errorMessage":"Failed to create socket"}}' >&2
+    exit 1
+fi
+
+# Launch the app (open -n forces new instance)
+open -n "$APP_PATH" --args "$MODIFIED_URL" "$SOCK_PATH"
+
+# Wait for response with timeout
+ELAPSED=0
+while kill -0 "$NC_PID" 2>/dev/null; do
+    if [[ "$ELAPSED" -ge "$TIMEOUT" ]]; then
+        kill "$NC_PID" 2>/dev/null || true
+        echo '{"success":false,"params":{"errorCode":"timeout","errorMessage":"Timed out after '"$TIMEOUT"'s"}}' >&2
+        exit 1
+    fi
+    sleep 1
+    ELAPSED=$((ELAPSED + 1))
+done
+
+# Read response
+RESPONSE=$(cat "$RESPONSE_FILE")
+
+if [[ -z "$RESPONSE" ]]; then
+    echo '{"success":false,"params":{"errorCode":"no_response","errorMessage":"No response received"}}' >&2
+    exit 1
+fi
+
+# Route output based on success field
+if echo "$RESPONSE" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin).get('success') else 1)" 2>/dev/null; then
+    echo "$RESPONSE"
+    exit 0
+else
+    echo "$RESPONSE" >&2
+    exit 1
+fi

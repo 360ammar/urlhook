@@ -1,0 +1,28 @@
+{
+  "name": "urlhook",
+  "version": "0.1.0",
+  "description": "Execute x-callback-urls from the command line on macOS",
+  "bin": {
+    "urlhook": "bin/urlhook"
+  },
+  "os": [
+    "darwin"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "x-callback-url",
+    "macos",
+    "cli",
+    "callback",
+    "url-scheme"
+  ],
+  "scripts": {
+    "prepublishOnly": "make build"
+  },
+  "files": [
+    "bin/",
+    "macos/",
+    "LICENSE",
+    "README.md"
+  ]
+}
